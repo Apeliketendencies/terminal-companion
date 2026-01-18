@@ -1,0 +1,4 @@
+requests
+lancedb
+numpy
+pandas
