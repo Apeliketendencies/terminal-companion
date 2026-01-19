@@ -5,18 +5,23 @@ import os
 import pandas as pd
 
 class MemoryManager:
-    def __init__(self, db_path="~/.lancedb"):
+    def __init__(self, db_path="~/.lancedb", dimension=None):
         self.db_path = os.path.expanduser(db_path)
         self.db = lancedb.connect(self.db_path)
-        self.table_name = "interactions"
-        self._init_db()
+        self.dimension = dimension
+        self.table_name = f"interactions_{dimension}" if dimension else "interactions"
+        if dimension:
+            self._init_db()
+        else:
+            self.table = None
 
     def _init_db(self):
+        if not self.dimension:
+            return
+
         if self.table_name not in self.db.table_names():
-            # Initial schema
-            # We need at least one record to define the schema if not using a pydantic model
-            # Let's use a dummy record with 4096 dimensions (default for many LLMs including dolphin-mistral)
-            dummy_emb = [0.0] * 4096
+            # Initial schema based on detected dimension
+            dummy_emb = [0.0] * self.dimension
             data = [{
                 "vector": dummy_emb,
                 "role": "system",
@@ -26,8 +31,16 @@ class MemoryManager:
             self.db.create_table(self.table_name, data=data)
         self.table = self.db.open_table(self.table_name)
 
+    def _ensure_initialized(self, embedding_len):
+        if self.table is None or self.dimension != embedding_len:
+            self.dimension = embedding_len
+            self.table_name = f"interactions_{self.dimension}"
+            self._init_db()
+
     def store_interaction(self, role, content, embedding, timestamp=None):
         import time
+        self._ensure_initialized(len(embedding))
+        
         if timestamp is None:
             timestamp = time.time()
         
@@ -39,10 +52,8 @@ class MemoryManager:
         }])
 
     def retrieve_context(self, query_embedding, top_k=5):
-        # LanceDB returns sorted results by distance
-        results = self.table.search(query_embedding).limit(top_k).to_list()
+        self._ensure_initialized(len(query_embedding))
+        # Use cosine metric for scale-invariant similarity
+        results = self.table.search(query_embedding).metric("cosine").limit(top_k).to_list()
         
-        # Convert distance to a similarity-like score if needed, 
-        # but LanceDB's search is already sorted by closest match.
-        # We can just return the content.
         return [(r["content"], r["_distance"]) for r in results]

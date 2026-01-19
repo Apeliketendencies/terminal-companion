@@ -179,3 +179,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+from .agent_utils import `cat agent_utils.py | grep '^def\s+' | awk '{print }'`
