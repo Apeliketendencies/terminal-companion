@@ -1,4 +1,0 @@
-requests
-lancedb
-numpy
-pandas
