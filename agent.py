@@ -51,15 +51,18 @@ def main():
     parser = argparse.ArgumentParser(description="Terminal AI Agent")
     parser.add_argument("command", nargs="*", help="CLI request to the agent")
     parser.add_argument("--run", action="store_true", help="Run the agent in CLI mode")
+    parser.add_argument("-e", "--endpoint", default="http://localhost:11434", help="Ollama API endpoint")
+    parser.add_argument("-m", "--model", default="gpt-oss:20b", help="LLM model to use")
+    parser.add_argument("--embed-model", help="Model to use for embeddings (defaults to --model)")
     parser.add_argument("-y", "--yes", action="store_true", help="Auto-confirm all commands")
     args = parser.parse_args()
 
     # Configuration
     DB_PATH = "~/.lancedb"
-    MODEL = "nemo-agent"
+    EMBED_MODEL = args.embed_model if args.embed_model else args.model
     
-    ollama = OllamaClient(model=MODEL)
-    memory = MemoryManager(db_path=DB_PATH)
+    ollama = OllamaClient(base_url=args.endpoint, model=args.model, embed_model=EMBED_MODEL)
+    memory = MemoryManager(db_path=DB_PATH, model_name=EMBED_MODEL)
 
     system_prompt_base = (
         "You are a powerful terminal AI agent with intelligent memory. "
@@ -75,6 +78,9 @@ def main():
     def process_request(request, auto_confirm=False):
         # 1. Get embedding for query
         query_embedding = ollama.get_embeddings(request)
+        
+        # Sync model name in case of auto-fallback
+        memory.model_name = memory._sanitize_model_name(ollama.embed_model)
 
         # 2. Retrieve relevant context
         context_hits = memory.retrieve_context(query_embedding, top_k=3)
@@ -93,14 +99,27 @@ def main():
 
         for turn in range(MAX_TURNS):
             # 5. Generate response
-            print(f"AI (Turn {turn+1}): ", end="", flush=True)
+            print(f"AI ({args.model}) (Turn {turn+1}): ", end="", flush=True)
+            
+            # Construct a single prompt from the messages for /api/generate
+            prompt = ""
+            system_msg = ""
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_msg = msg["content"]
+                elif msg["role"] == "user":
+                    prompt += f"\nUser: {msg['content']}\n"
+                elif msg["role"] == "assistant":
+                    prompt += f"\nAssistant: {msg['content']}\n"
+            prompt += "\nAssistant: "
+
             try:
-                response_data = ollama.chat(messages)
+                response_data = ollama.generate(prompt, system_prompt=system_msg)
             except Exception as e:
                 print(f"Error communicating with AI: {e}")
                 break
             
-            full_response = response_data['message']['content']
+            full_response = response_data['response']
             print(full_response)
             
             # Add assistant's response to message history
@@ -160,7 +179,7 @@ def main():
             return
 
     # Interactive Mode
-    print(f"--- Terminal AI Agent Activated (Model: {MODEL}) ---")
+    print(f"--- Terminal AI Agent Activated (Model: {args.model}) ---")
     print("Type 'exit' or 'quit' to end session.\n")
 
     while True:
