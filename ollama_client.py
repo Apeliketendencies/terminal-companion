@@ -38,10 +38,11 @@ class OllamaClient:
         except:
             return False
 
-    def generate(self, prompt, system_prompt=None, context=None, stream=False):
+    def generate(self, prompt, system_prompt=None, context=None, stream=False, model=None, keep_alive=None):
         url = f"{self.base_url}/api/generate"
+        target_model = model or self.model
         payload = {
-            "model": self.model,
+            "model": target_model,
             "prompt": prompt,
             "stream": stream
         }
@@ -49,6 +50,8 @@ class OllamaClient:
             payload["system"] = system_prompt
         if context:
             payload["context"] = context
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
         
         response = requests.post(url, json=payload)
         response.raise_for_status()
@@ -58,13 +61,17 @@ class OllamaClient:
         else:
             return response.json()
 
-    def chat(self, messages, stream=False):
+    def chat(self, messages, stream=False, model=None, keep_alive=None):
         url = f"{self.base_url}/api/chat"
+        target_model = model or self.model
         payload = {
-            "model": self.model,
+            "model": target_model,
             "messages": messages,
             "stream": stream
         }
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
+
         response = requests.post(url, json=payload)
         response.raise_for_status()
         

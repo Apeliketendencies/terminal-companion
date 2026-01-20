@@ -52,24 +52,52 @@ def main():
     parser.add_argument("command", nargs="*", help="CLI request to the agent")
     parser.add_argument("--run", action="store_true", help="Run the agent in CLI mode")
     parser.add_argument("-e", "--endpoint", default="http://localhost:11434", help="Ollama API endpoint")
-    parser.add_argument("-m", "--model", default="gpt-oss:20b", help="LLM model to use")
-    parser.add_argument("--embed-model", help="Model to use for embeddings (defaults to --model)")
+    parser.add_argument("-m", "--model", default="mistral-nemo:12b", help="LLM model to use")
+    parser.add_argument("--embed-model", default="nomic-embed-text:latest", help="Model to use for embeddings")
     parser.add_argument("-y", "--yes", action="store_true", help="Auto-confirm all commands")
     args = parser.parse_args()
 
+    # Specialized Units Configuration
+    UNITS = {
+        "GENERAL": args.model,
+        "ARCHITECT": "qwen2.5-coder:1.5b",
+        "SCRIBE": "smollm2:360m",
+        "SCOUT": "gemma3:1b"
+    }
+
     # Configuration
-    DB_PATH = "~/.lancedb"
-    EMBED_MODEL = args.embed_model if args.embed_model else args.model
+    DB_PATH = os.path.expanduser("~/.lancedb")
+    EMBED_MODEL = args.embed_model
     
     ollama = OllamaClient(base_url=args.endpoint, model=args.model, embed_model=EMBED_MODEL)
     memory = MemoryManager(db_path=DB_PATH, model_name=EMBED_MODEL)
 
+    PROMPTS = {
+        "ARCHITECT": (
+            "You are the ARCHITECT unit. Your job is to generate the exact bash command "
+            "based on the GENERAL's request. Output ONLY the code block.\n"
+            "Example: ```bash\nls -la\n```"
+        ),
+        "SCRIBE": (
+            "You are the SCRIBE unit. Summarize the following terminal output into a concise summary. "
+            "Highlight errors or key results. Keep it under 3 sentences."
+        ),
+        "SCOUT": (
+            "You are the SCOUT unit. Analyze the following command for safety. "
+            "If it is destructive (rm -rf, etc.) or highly risky, output 'RISK: [reason]'. "
+            "Otherwise, output 'SAFE'."
+        )
+    }
+
     system_prompt_base = (
-        "You are a powerful terminal AI agent with intelligent memory. "
-        "You can execute commands in the user's terminal by providing code blocks like this:\n"
-        "```bash\n# your command here\n```\n"
-        "Always explain what the command does before providing it. "
-        "If sudo is needed, include it in the command. "
+        f"You are the GENERAL (Mistral Nemo). You lead a team of specialized AI units:\n"
+        f"- ARCHITECT ({UNITS['ARCHITECT']}): Generates precise bash commands.\n"
+        f"- SCRIBE ({UNITS['SCRIBE']}): Summarizes large terminal outputs.\n"
+        f"- SCOUT ({UNITS['SCOUT']}): Checks command safety.\n\n"
+        "To execute a command, simply describe what you want to do in a code block with 'PLAN'. "
+        "The ARCHITECT will then generate the bash for you.\n"
+        "Example:\n"
+        "```PLAN\nList all files in the current directory\n```\n"
         "Use the provided context from memory if relevant.\n\n"
     )
 
@@ -84,7 +112,7 @@ def main():
 
         # 2. Retrieve relevant context
         context_hits = memory.retrieve_context(query_embedding, top_k=3)
-        context_str = "\n".join([f"- {content}" for content, dist in context_hits if dist < 0.7]) # Cosine distance threshold
+        context_str = "\n".join([f"- {content}" for content, dist in context_hits if dist < 0.7])
 
         # 3. Get system context
         system_env = get_system_context()
@@ -98,10 +126,9 @@ def main():
         current_auto_confirm = auto_confirm
 
         for turn in range(MAX_TURNS):
-            # 5. Generate response
-            print(f"AI ({args.model}) (Turn {turn+1}): ", end="", flush=True)
+            # 5. Generate response (GENERAL)
+            print(f"GENERAL ({UNITS['GENERAL']}) (Turn {turn+1}): ", end="", flush=True)
             
-            # Construct a single prompt from the messages for /api/generate
             prompt = ""
             system_msg = ""
             for msg in messages:
@@ -114,29 +141,59 @@ def main():
             prompt += "\nAssistant: "
 
             try:
-                response_data = ollama.generate(prompt, system_prompt=system_msg)
+                # Use GENERAL model
+                response_data = ollama.generate(prompt, system_prompt=system_msg, model=UNITS['GENERAL'])
             except Exception as e:
                 print(f"Error communicating with AI: {e}")
                 break
             
             full_response = response_data['response']
             print(full_response)
-            
-            # Add assistant's response to message history
             messages.append({"role": "assistant", "content": full_response})
 
-            # 6. Check for code blocks
-            cmds = re.findall(r'```(?:bash|sh)\n(.*?)```', full_response, re.DOTALL)
+            # 6. Check for PLAN blocks (Delegation to ARCHITECT)
+            plans = re.findall(r'```PLAN\n(.*?)```', full_response, re.DOTALL)
             
-            if not cmds:
-                # No more commands, we are likely done
+            # Also check for direct bash blocks just in case Nemo does it anyway
+            direct_cmds = re.findall(r'```(?:bash|sh)\n(.*?)```', full_response, re.DOTALL)
+            
+            cmds_to_run = []
+
+            # Delegate to ARCHITECT if plans exist
+            for plan in plans:
+                print(f"→ Delegating to ARCHITECT ({UNITS['ARCHITECT']})...")
+                arch_resp = ollama.generate(f"GENERAL's PLAN: {plan.strip()}", system_prompt=PROMPTS['ARCHITECT'], model=UNITS['ARCHITECT'], keep_alive=0)
+                arch_cmd_block = arch_resp['response']
+                arch_cmds = re.findall(r'```(?:bash|sh)\n(.*?)```', arch_cmd_block, re.DOTALL)
+                if arch_cmds:
+                    cmds_to_run.extend(arch_cmds)
+                else:
+                    # Fallback: if Architect didn't wrap in bash, take the whole thing
+                    cmds_to_run.append(arch_cmd_block.strip())
+
+            # Add direct commands if any
+            cmds_to_run.extend(direct_cmds)
+
+            if not cmds_to_run:
                 break
 
-            # Execute commands and collect output
+            # 7. Scout Check
+            for cmd in list(cmds_to_run):
+                scout_resp = ollama.generate(f"COMMAND: {cmd.strip()}", system_prompt=PROMPTS['SCOUT'], model=UNITS['SCOUT'], keep_alive=0)
+                scout_eval = scout_resp['response'].strip()
+                if "RISK" in scout_eval.upper():
+                    print(f"→ SCOUT WARNING: {scout_eval}")
+                    if not auto_confirm:
+                        choice = input("Proceed anyway? (y/n): ").strip().lower()
+                        if choice != 'y':
+                            cmds_to_run.remove(cmd)
+                            continue
+
+            # Execute commands
             turn_outputs = []
             user_skipped = False
 
-            for cmd in cmds:
+            for cmd in cmds_to_run:
                 cmd_output, auto_confirm_now = run_command(cmd.strip(), auto_confirm=current_auto_confirm)
                 if auto_confirm_now:
                     current_auto_confirm = True
@@ -145,20 +202,23 @@ def main():
                     user_skipped = True
                     break
                 
+                # 8. Scribe Summarization for large outputs
+                if len(cmd_output.splitlines()) > 15:
+                    print(f"→ Large output. SCRIBE ({UNITS['SCRIBE']}) is summarizing...")
+                    scribe_resp = ollama.generate(f"OUTPUT TO SUMMARIZE:\n{cmd_output}", system_prompt=PROMPTS['SCRIBE'], model=UNITS['SCRIBE'], keep_alive=0)
+                    summary = scribe_resp['response']
+                    cmd_output = f"SUMMARY OF LARGE OUTPUT:\n{summary}\n(Raw output was {len(cmd_output)} chars)"
+                
                 turn_outputs.append(cmd_output)
-                # Store system output in memory immediately for cross-session awareness
                 memory.store_interaction("system", cmd_output, ollama.get_embeddings(cmd_output))
 
             if user_skipped:
-                print("User skipped execution. Ending loop.")
                 break
 
             if turn_outputs:
-                # Feed the output back into the conversation for the next turn
                 combined_output = "\n".join(turn_outputs)
-                messages.append({"role": "user", "content": f"Command output:\n{combined_output}\n\nPlease analyze the output and continue if needed."})
+                messages.append({"role": "user", "content": f"Command output:\n{combined_output}\n\nPlease analyze and continue."})
             else:
-                # This shouldn't really happen if cmds existed and weren't skipped
                 break
 
         # 7. Store final interaction to memory
